@@ -1,0 +1,110 @@
+name: Build Nowen Note IPA (iOS 15, TrollStore)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-ios-ipa.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned IPA for TrollStore
+    runs-on: macos-26
+    timeout-minutes: 110
+    steps:
+      - name: Checkout build launcher
+        uses: actions/checkout@v4
+
+      - name: Check Xcode and tools
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          node --version || true
+          pod --version || true
+
+      - name: Checkout official Nowen Note v1.5.3
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.5.3 https://github.com/cropflre/nowen-note.git nowen-note
+          echo "Official source commit: $(git -C nowen-note rev-parse HEAD)"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install root dependencies
+        working-directory: nowen-note
+        run: npm ci --no-audit --no-fund
+
+      - name: Install frontend dependencies
+        working-directory: nowen-note/frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Build full frontend
+        working-directory: nowen-note/frontend
+        env:
+          NODE_ENV: production
+          NODE_OPTIONS: '--max-old-space-size=4096'
+        run: npm run build
+
+      - name: Sync Capacitor iOS
+        working-directory: nowen-note/frontend
+        env:
+          NODE_ENV: production
+        run: npx cap sync ios
+
+      - name: Install CocoaPods
+        working-directory: nowen-note/frontend/ios/App
+        run: pod install --repo-update
+
+      - name: Build iOS app without developer certificate
+        working-directory: nowen-note/frontend/ios/App
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/nowen-build" \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build 2>&1 | tee "$RUNNER_TEMP/nowen-xcodebuild.log"
+
+      - name: Package real unsigned IPA and verify metadata
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/nowen-build/Build/Products/Release-iphoneos/App.app"
+          test -d "$APP" || { echo "Missing App.app"; exit 1; }
+          test -f "$APP/Info.plist" || { echo "Missing Info.plist"; exit 1; }
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          test -f "$APP/$EXECUTABLE" || { echo "Missing executable"; exit 1; }
+          MINIOS=$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")
+          echo "Minimum iOS: $MINIOS"
+          echo "App executable architectures: $(lipo -archs "$APP/$EXECUTABLE")"
+          python3 - "$MINIOS" <<'PY'
+          import sys
+          assert tuple(map(int, sys.argv[1].split('.'))) <= (15,3), "The built IPA does not support iOS 15.3"
+          PY
+          mkdir -p "$RUNNER_TEMP/export/Payload"
+          ditto "$APP" "$RUNNER_TEMP/export/Payload/App.app"
+          cd "$RUNNER_TEMP/export"
+          zip -qry "$GITHUB_WORKSPACE/Nowen-Note-v1.5.3-iOS15-TrollStore-unsigned.ipa" Payload
+          ls -lh "$GITHUB_WORKSPACE/"*.ipa
+          unzip -t "$GITHUB_WORKSPACE/"*.ipa | tail -n 2
+
+      - name: Upload compiled IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nowen-Note-v1.5.3-iOS15-TrollStore-IPA
+          path: Nowen-Note-v1.5.3-iOS15-TrollStore-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
