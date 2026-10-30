@@ -88,6 +88,128 @@ jobs:
           console.log('Object.hasOwn polyfill tested in isolated runtime');
           JS
 
+      - name: Patch iOS 15.3 WebKit missing APIs and improve crash diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("nowen-note/frontend/index.html")
+          html = p.read_text(encoding="utf-8")
+          needle = '        var nativeFeatures = {'
+          assert html.count(needle) == 1
+          code = """
+        // Nowen iOS 15.3 compatibility: install before any app or vendor ES modules.
+        (function () {
+          function addMethod(obj, name, implementation) {
+            if (!obj || typeof obj[name] === "function") return;
+            try { Object.defineProperty(obj, name, { configurable: true, writable: true, value: implementation }); }
+            catch (e) { try { obj[name] = implementation; } catch (ignored) {} }
+          }
+          function atIndex(index) {
+            var n = Number(index) || 0;
+            if (!isFinite(n)) return undefined;
+            n = n < 0 ? Math.ceil(n) : Math.floor(n);
+            var len = this.length >>> 0;
+            return this[n < 0 ? n + len : n];
+          }
+          addMethod(Array.prototype, "at", atIndex);
+          addMethod(String.prototype, "at", function (index) {
+            var s = String(this);
+            return atIndex.call(s, index);
+          });
+          var typedArrays = ["Uint8Array","Uint8ClampedArray","Int8Array","Uint16Array","Int16Array","Uint32Array","Int32Array","Float32Array","Float64Array","BigInt64Array","BigUint64Array"];
+          for (var i = 0; i < typedArrays.length; i++) {
+            var C = window[typedArrays[i]];
+            if (C && C.prototype) addMethod(C.prototype, "at", atIndex);
+          }
+          if (typeof URL !== "undefined") {
+            addMethod(URL, "canParse", function (url, base) {
+              try { new URL(url, base); return true; } catch (e) { return false; }
+            });
+          }
+          if (typeof Promise !== "undefined") {
+            addMethod(Promise, "withResolvers", function () {
+              var resolve, reject;
+              var promise = new Promise(function (res, rej) { resolve = res; reject = rej; });
+              return { promise: promise, resolve: resolve, reject: reject };
+            });
+          }
+          if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+            addMethod(window.crypto, "randomUUID", function () {
+              var bytes = new Uint8Array(16);
+              window.crypto.getRandomValues(bytes);
+              bytes[6] = (bytes[6] & 15) | 64;
+              bytes[8] = (bytes[8] & 63) | 128;
+              var str = "";
+              for (var j = 0; j < 16; j++) {
+                if (j === 4 || j === 6 || j === 8 || j === 10) str += "-";
+                str += (bytes[j] + 256).toString(16).slice(1);
+              }
+              return str;
+            });
+          }
+        })();
+          """.strip("\n")
+          html = html.replace(needle, code + "\n" + needle, 1)
+          previous = 'return String(error.stack || error.message || error);'
+          replacement = 'return String((error.name ? error.name + ": " : "") + (error.message || String(error))) + "\\n" + String(error.stack || "");'
+          assert html.count(previous) == 1, "Error reporter changed upstream"
+          html = html.replace(previous, replacement, 1)
+          p.write_text(html, encoding="utf-8")
+          print("Injected iOS 15.3 compatibility code and improved error messages")
+          PY
+
+      - name: Test compatibility patch without native modern methods
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'JS'
+          const fs = require('fs'), vm = require('vm');
+          const html=fs.readFileSync('nowen-note/frontend/index.html','utf8');
+          const a=html.indexOf('// Nowen iOS 15.3 compatibility:');
+          const b=html.indexOf('var nativeFeatures = {',a);
+          if(a<0||b<a)throw Error('compatibility code missing');
+          const source=html.slice(a,b);
+          const ctx=vm.createContext({
+            window:{crypto:{getRandomValues:(x)=>{for(let i=0;i<x.length;i++)x[i]=i*23%256;return x;}}},
+            URL,
+            Promise
+          });
+          vm.runInContext('Array.prototype.at=undefined;String.prototype.at=undefined;',ctx);
+          vm.runInContext(source,ctx);
+          const ok=vm.runInContext("[1,2,3].at(-1)===3 && 'abc'.at(-1)==='c' && window.crypto.randomUUID().length===36 && URL.canParse('https://example.com')",ctx);
+          if(!ok)throw Error('iOS 15.3 polyfill smoke test failed');
+          console.log('iOS 15.3 compatibility smoke test passed');
+          JS
+
+      - name: Prepare corrected optical center for iOS app icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --break-system-packages "Pillow>=10,<13" || python3 -m pip install --quiet "Pillow>=10,<13"
+          python3 - <<'PY'
+          from pathlib import Path
+          from PIL import Image, ImageChops
+          import numpy as np
+          # Preserve original brand art and translate only foreground, leaving original canvas size.
+          p = Path("nowen-note/frontend/ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png")
+          im = Image.open(p).convert('RGBA')
+          bg=im.getpixel((0,0))
+          channels=ImageChops.difference(im.convert('RGB'), Image.new('RGB',im.size,bg[:3])).split()
+          # Use PIL channel maximum; numpy is not required on the runner.
+          mask=ImageChops.lighter(ImageChops.lighter(channels[0],channels[1]),channels[2]).point(lambda v: 255 if v>30 else 0)
+          bb=mask.getbbox()
+          assert bb is not None, "Icon appears blank"
+          dx=round((im.width-bb[0]-bb[2])/2)
+          dy=round((im.height-bb[1]-bb[3])/2)
+          assert abs(dx)<im.width/10 and abs(dy)<im.height/10, "Unsafe icon shift"
+          centered=Image.new('RGBA', im.size, bg)
+          centered.paste(im,(dx,dy))
+          centered.convert('RGB').save(p,optimize=True)
+          print(f"Centered icon source {p}: foreground {bb}, shift=({dx},{dy}), size={im.size}")
+          PY
+
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
@@ -160,7 +282,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/export/Payload"
           ditto "$APP" "$RUNNER_TEMP/export/Payload/App.app"
           cd "$RUNNER_TEMP/export"
-          zip -qry "$GITHUB_WORKSPACE/Nowen-Note-v1.5.3-iOS15.3-fixed-TrollStore.ipa" Payload
+          zip -qry "$GITHUB_WORKSPACE/Nowen-Note-v1.5.3-iOS15.3-WhiteScreen-IconFix-TrollStore.ipa" Payload
           ls -lh "$GITHUB_WORKSPACE/"*.ipa
           unzip -t "$GITHUB_WORKSPACE/"*.ipa | tail -n 2
           unzip -p "$GITHUB_WORKSPACE/"*.ipa Payload/App.app/public/index.html | grep -q 'iOS 15.3 startup fix'
@@ -169,7 +291,7 @@ jobs:
       - name: Upload compiled IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Nowen-Note-v1.5.3-iOS15.3-FIXED-IPA
-          path: Nowen-Note-v1.5.3-iOS15.3-fixed-TrollStore.ipa
+          name: Nowen-Note-v1.5.3-iOS15.3-WhiteScreen-IconFix-IPA
+          path: Nowen-Note-v1.5.3-iOS15.3-WhiteScreen-IconFix-TrollStore.ipa
           if-no-files-found: error
           retention-days: 30
