@@ -191,7 +191,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           from PIL import Image, ImageChops
-          import numpy as np
           # Preserve original brand art and translate only foreground, leaving original canvas size.
           p = Path("nowen-note/frontend/ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png")
           im = Image.open(p).convert('RGBA')
