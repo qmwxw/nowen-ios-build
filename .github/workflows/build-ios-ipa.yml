@@ -32,6 +32,62 @@ jobs:
           git clone --depth 1 --branch v1.5.3 https://github.com/cropflre/nowen-note.git nowen-note
           echo "Official source commit: $(git -C nowen-note rev-parse HEAD)"
 
+      - name: Fix iOS 15.3 WebKit Object.hasOwn startup crash
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("nowen-note/frontend/index.html")
+          html = p.read_text(encoding="utf-8")
+          anchor = "        var nativeFeatures = {"
+          assert html.count(anchor) == 1, "Upstream bootstrap layout changed; abort rather than silently miss patch"
+          # A classic script in index.html runs BEFORE any ES module (including vendor highlighter).
+          # Safari/WKWebView on iOS 15.3 does not provide Object.hasOwn (added in 15.4).
+          polyfill = """        // iOS 15.3 startup fix: lowlight/highlight.js calls Object.hasOwn during import.
+                  if (typeof Object.hasOwn !== "function") {
+                    Object.defineProperty(Object, "hasOwn", {
+                      configurable: true,
+                      writable: true,
+                      enumerable: false,
+                      value: function (value, key) {
+                        if (value === null || value === undefined) {
+                          throw new TypeError("Cannot convert undefined or null to object");
+                        }
+                        return Object.prototype.hasOwnProperty.call(Object(value), key);
+                      }
+                    });
+                  }
+
+          """
+          # Dedent the injected text to match the existing inline script indentation.
+          import textwrap
+          polyfill = textwrap.dedent(polyfill).rstrip() + "\n"
+          html = html.replace(anchor, polyfill + anchor, 1)
+          p.write_text(html, encoding="utf-8")
+          print("Patched", p)
+          PY
+
+      - name: Confirm iOS compatibility fix precedes module imports
+        run: |
+          set -euo pipefail
+          node - <<'JS'
+          const fs = require('fs');
+          const vm = require('vm');
+          const html = fs.readFileSync('nowen-note/frontend/index.html', 'utf8');
+          const begin = html.indexOf('// iOS 15.3 startup fix:');
+          const end = html.indexOf('var nativeFeatures = {', begin);
+          if (begin < 0 || end <= begin) throw Error('Object.hasOwn bootstrap fix not found');
+          if (html.indexOf('type="module"') > -1 && begin > html.indexOf('type="module"')) throw Error('Fix runs after module');
+          const js = html.slice(begin, end);
+          const ctx = vm.createContext({});
+          vm.runInContext("Object.hasOwn = undefined", ctx);
+          vm.runInContext(js, ctx);
+          if (!vm.runInContext("Object.hasOwn({ a: 1 }, 'a') === true && !Object.hasOwn({a:1}, 'b')", ctx)) throw Error('Broken Object.hasOwn polyfill');
+          if (!vm.runInContext("Object.hasOwn(Object.create(null), 'missing') === false", ctx)) throw Error('Null prototype test failed');
+          console.log('Object.hasOwn polyfill tested in isolated runtime');
+          JS
+
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
@@ -51,6 +107,13 @@ jobs:
           NODE_ENV: production
           NODE_OPTIONS: '--max-old-space-size=4096'
         run: npm run build
+
+      - name: Verify compiled frontend retains pre-module fix
+        run: |
+          set -euo pipefail
+          grep -q 'iOS 15.3 startup fix' nowen-note/frontend/dist/index.html
+          grep -q 'Object.hasOwn' nowen-note/frontend/dist/index.html
+          echo 'Compatibility prelude retained in packaged frontend'
 
       - name: Sync Capacitor iOS
         working-directory: nowen-note/frontend
@@ -97,14 +160,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/export/Payload"
           ditto "$APP" "$RUNNER_TEMP/export/Payload/App.app"
           cd "$RUNNER_TEMP/export"
-          zip -qry "$GITHUB_WORKSPACE/Nowen-Note-v1.5.3-iOS15-TrollStore-unsigned.ipa" Payload
+          zip -qry "$GITHUB_WORKSPACE/Nowen-Note-v1.5.3-iOS15.3-fixed-TrollStore.ipa" Payload
           ls -lh "$GITHUB_WORKSPACE/"*.ipa
           unzip -t "$GITHUB_WORKSPACE/"*.ipa | tail -n 2
+          unzip -p "$GITHUB_WORKSPACE/"*.ipa Payload/App.app/public/index.html | grep -q 'iOS 15.3 startup fix'
+          echo 'Verified fix is present inside the actual IPA'
 
       - name: Upload compiled IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Nowen-Note-v1.5.3-iOS15-TrollStore-IPA
-          path: Nowen-Note-v1.5.3-iOS15-TrollStore-unsigned.ipa
+          name: Nowen-Note-v1.5.3-iOS15.3-FIXED-IPA
+          path: Nowen-Note-v1.5.3-iOS15.3-fixed-TrollStore.ipa
           if-no-files-found: error
           retention-days: 30
