@@ -99,8 +99,8 @@ jobs:
           needle = '        var nativeFeatures = {'
           assert html.count(needle) == 1
           code = """
-        // Nowen iOS 15.3 compatibility: install before any app or vendor ES modules.
-        (function () {
+          // Nowen iOS 15.3 compatibility: install before any app or vendor ES modules.
+          (function () {
           function addMethod(obj, name, implementation) {
             if (!obj || typeof obj[name] === "function") return;
             try { Object.defineProperty(obj, name, { configurable: true, writable: true, value: implementation }); }
@@ -149,7 +149,7 @@ jobs:
               return str;
             });
           }
-        })();
+          })();
           """.strip("\n")
           html = html.replace(needle, code + "\n" + needle, 1)
           previous = 'return String(error.stack || error.message || error);'
